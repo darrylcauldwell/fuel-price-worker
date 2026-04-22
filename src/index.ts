@@ -16,7 +16,7 @@ export interface Env {
 
 // --- Constants ---
 
-const API_BASE = "https://api.fuelfinder.service.gov.uk/v1";
+const API_BASE = "https://www.fuel-finder.service.gov.uk/api/v1";
 const TOKEN_ENDPOINT = `${API_BASE}/oauth/generate_access_token`;
 const STATIONS_ENDPOINT = `${API_BASE}/pfs`;
 const PRICES_ENDPOINT = `${API_BASE}/pfs/fuel-prices`;
@@ -38,6 +38,13 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+};
+
+// Headers to pass CloudFront WAF on the government API
+const API_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+  "Accept": "application/json, */*",
+  "Accept-Language": "en-GB,en;q=0.9",
 };
 
 // --- OAuth Token Management ---
@@ -64,7 +71,7 @@ async function getAccessToken(env: Env): Promise<string> {
 
   const resp = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: { ...API_HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
     body: body.toString(),
   });
 
@@ -73,10 +80,22 @@ async function getAccessToken(env: Env): Promise<string> {
     throw new Error(`OAuth token request failed (${resp.status}): ${text}`);
   }
 
-  const data = (await resp.json()) as { access_token: string; expires_in: number };
+  const raw = await resp.text();
+  console.log("OAuth response:", raw);
+  const data = JSON.parse(raw) as Record<string, unknown>;
+  // Extract token — handle nested response formats
+  const accessToken = (data.access_token || (data.data as Record<string, unknown>)?.access_token) as string;
+  const expiresIn = (data.expires_in || (data.data as Record<string, unknown>)?.expires_in || 3600) as number;
+
+  if (!accessToken) {
+    throw new Error(`OAuth response missing access_token: ${raw}`);
+  }
+
+  console.log(`Token obtained, expires in ${expiresIn}s, starts with: ${accessToken.substring(0, 20)}...`);
+
   const token: OAuthToken = {
-    access_token: data.access_token,
-    expires_at: Date.now() + data.expires_in * 1000 - 60000, // 1 min buffer
+    access_token: accessToken,
+    expires_at: Date.now() + expiresIn * 1000 - 60000, // 1 min buffer
   };
 
   await env.FUEL_CACHE.put(KV_TOKEN, JSON.stringify(token), { expirationTtl: TOKEN_TTL });
@@ -85,26 +104,29 @@ async function getAccessToken(env: Env): Promise<string> {
 
 // --- Paginated API Fetch ---
 
-async function fetchAllBatches(endpoint: string, token: string, queryParams?: string): Promise<unknown[]> {
+async function fetchAllBatches(endpoint: string, token: string, extraParams?: Record<string, string>): Promise<unknown[]> {
   const allRecords: unknown[] = [];
   let batch = 1;
 
   while (true) {
-    const separator = queryParams ? "&" : "?";
-    const url = queryParams
-      ? `${endpoint}?${queryParams}${separator}batch-number=${batch}`
-      : `${endpoint}?batch-number=${batch}`;
+    const params = new URLSearchParams({ "batch-number": String(batch) });
+    if (extraParams) {
+      for (const [k, v] of Object.entries(extraParams)) {
+        params.set(k, v);
+      }
+    }
+    const url = `${endpoint}?${params.toString()}`;
+    console.log(`Fetching: ${url}`);
 
     const resp = await fetch(url, {
       headers: {
+        ...API_HEADERS,
         Authorization: `Bearer ${token}`,
-        Accept: "application/json",
       },
     });
 
     if (!resp.ok) {
       if (resp.status === 429) {
-        // Rate limited — wait and retry
         await new Promise((r) => setTimeout(r, 2000));
         continue;
       }
@@ -112,10 +134,14 @@ async function fetchAllBatches(endpoint: string, token: string, queryParams?: st
       throw new Error(`API request failed (${resp.status}): ${text}`);
     }
 
-    const data = (await resp.json()) as { data?: unknown[]; items?: unknown[] };
-    const records = data.data || data.items || [];
+    const raw = await resp.text();
+    console.log(`Batch ${batch}: ${raw.length} bytes, first 200 chars: ${raw.substring(0, 200)}`);
+    const parsed = JSON.parse(raw);
 
-    if (!Array.isArray(records) || records.length === 0) {
+    // Response is a raw JSON array
+    const records: unknown[] = Array.isArray(parsed) ? parsed : [];
+
+    if (records.length === 0) {
       break;
     }
 
@@ -150,12 +176,11 @@ async function syncPrices(env: Env): Promise<void> {
 
   // Use incremental update if we have a last sync timestamp
   const lastSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
-  let queryParams: string | undefined;
-  if (lastSync) {
-    queryParams = `effective-start-timestamp=${encodeURIComponent(lastSync)}`;
-  }
+  const extraParams = lastSync
+    ? { "effective-start-timestamp": lastSync }
+    : undefined;
 
-  const prices = await fetchAllBatches(PRICES_ENDPOINT, token, queryParams);
+  const prices = await fetchAllBatches(PRICES_ENDPOINT, token, extraParams);
 
   if (lastSync && prices.length > 0) {
     // Merge incremental updates with existing cached prices

@@ -2,10 +2,15 @@ name = "fuel-price-worker"
 main = "src/index.ts"
 compatibility_date = "2026-04-22"
 
+# Route on dreamfold.dev
+routes = [
+  { pattern = "fuel.dreamfold.dev/*", zone_id = "8916ed61d713d42ace0f4648ad952e1c" }
+]
+
 # KV namespace for caching station and price data
 [[kv_namespaces]]
 binding = "FUEL_CACHE"
-id = ""  # Set after `wrangler kv namespace create FUEL_CACHE`
+id = "061cb51abb314c9387f875bb1676ff2c"
 
 # Secrets (set via `wrangler secret put`):
 #   FUEL_API_CLIENT_ID     — OAuth client_id from Fuel Finder developer portal
