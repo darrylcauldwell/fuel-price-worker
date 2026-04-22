@@ -29,8 +29,10 @@ const KV_TOKEN = "oauth_token";
 const KV_LAST_PRICE_SYNC = "last_price_sync";
 
 // Cache TTLs (seconds)
+// TTLs are set long so cached data survives API outages.
+// The cron refreshes every 5 minutes regardless — TTL is a safety net, not the refresh driver.
 const STATIONS_TTL = 86400; // 24 hours — station metadata changes rarely
-const PRICES_TTL = 600; // 10 minutes — prices update frequently
+const PRICES_TTL = 86400; // 24 hours — stale prices are better than no prices during an outage
 const TOKEN_TTL = 3500; // Just under 1 hour (tokens expire at 3600)
 
 // CORS headers for mobile app access
