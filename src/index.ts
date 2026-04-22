@@ -183,48 +183,119 @@ async function syncStations(env: Env): Promise<void> {
   console.log(`Synced ${stations.length} stations`);
 }
 
+// Maximum batches per invocation to stay within Worker execution time limits.
+// Each batch is one API call (~500 records). Full dataset is ~16 batches.
+// On cron (every 5 min) we progressively build the dataset over multiple runs.
+const MAX_BATCHES_PER_RUN = 2;
+const KV_PRICE_BATCH_CURSOR = "price_batch_cursor";
+
 async function syncPrices(env: Env): Promise<void> {
   const token = await getAccessToken(env);
 
-  // Use incremental update if we have a last sync timestamp
   const lastSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
-  const extraParams = lastSync
-    ? { "effective-start-timestamp": lastSync }
-    : undefined;
 
-  const prices = await fetchAllBatches(PRICES_ENDPOINT, token, extraParams);
+  if (lastSync) {
+    // Incremental: fetch only changes since last sync (usually 1 batch, very fast)
+    const prices = await fetchAllBatches(PRICES_ENDPOINT, token, {
+      "effective-start-timestamp": lastSync,
+    });
 
-  if (lastSync && prices.length > 0) {
-    // Merge incremental updates with existing cached prices
+    if (prices.length > 0) {
+      const existingRaw = await env.FUEL_CACHE.get(KV_PRICES);
+      const existing = existingRaw ? (JSON.parse(existingRaw) as Record<string, unknown>[]) : [];
+
+      const priceMap = new Map<string, unknown>();
+      for (const p of existing) {
+        const record = p as Record<string, unknown>;
+        priceMap.set(record.node_id as string, record);
+      }
+      for (const p of prices) {
+        const record = p as Record<string, unknown>;
+        priceMap.set(record.node_id as string, record);
+      }
+
+      const merged = Array.from(priceMap.values());
+      await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(merged), { expirationTtl: PRICES_TTL });
+      console.log(`Merged ${prices.length} incremental updates (total: ${merged.length})`);
+    }
+
+    const now = new Date().toISOString().replace("T", " ").substring(0, 19);
+    await env.FUEL_CACHE.put(KV_LAST_PRICE_SYNC, now, { expirationTtl: STATIONS_TTL });
+  } else {
+    // Full sync: progressive — fetch MAX_BATCHES_PER_RUN batches per invocation,
+    // resume from cursor on next cron run until complete.
+    const cursorStr = await env.FUEL_CACHE.get(KV_PRICE_BATCH_CURSOR);
+    const startBatch = cursorStr ? parseInt(cursorStr, 10) : 1;
+
+    console.log(`Full price sync: starting from batch ${startBatch}`);
+
+    const allRecords: unknown[] = [];
+    let batch = startBatch;
+    let reachedEnd = false;
+
+    for (let i = 0; i < MAX_BATCHES_PER_RUN; i++) {
+      const params = new URLSearchParams({ "batch-number": String(batch) });
+      const url = `${PRICES_ENDPOINT}?${params.toString()}`;
+
+      const resp = await fetch(url, {
+        headers: { ...API_HEADERS, Authorization: `Bearer ${token}` },
+      });
+
+      if (!resp.ok) {
+        if (resp.status === 429) {
+          console.log("Rate limited during full sync, will resume next run");
+          break;
+        }
+        const text = await resp.text();
+        throw new Error(`Price fetch failed (${resp.status}): ${text}`);
+      }
+
+      const parsed = JSON.parse(await resp.text());
+      const records: unknown[] = Array.isArray(parsed) ? parsed : [];
+
+      if (records.length === 0) {
+        reachedEnd = true;
+        break;
+      }
+
+      allRecords.push(...records);
+      if (records.length < BATCH_SIZE) {
+        reachedEnd = true;
+        break;
+      }
+      batch++;
+    }
+
+    // Merge with existing partial data
     const existingRaw = await env.FUEL_CACHE.get(KV_PRICES);
     const existing = existingRaw ? (JSON.parse(existingRaw) as Record<string, unknown>[]) : [];
 
-    // Build lookup by node_id for fast merge
     const priceMap = new Map<string, unknown>();
     for (const p of existing) {
       const record = p as Record<string, unknown>;
       priceMap.set(record.node_id as string, record);
     }
-    for (const p of prices) {
+    for (const p of allRecords) {
       const record = p as Record<string, unknown>;
       priceMap.set(record.node_id as string, record);
     }
 
     const merged = Array.from(priceMap.values());
-    await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(merged), {
-      expirationTtl: PRICES_TTL,
-    });
-    console.log(`Merged ${prices.length} price updates (total: ${merged.length})`);
-  } else {
-    await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(prices), {
-      expirationTtl: PRICES_TTL,
-    });
-    console.log(`Synced ${prices.length} prices (full refresh)`);
-  }
+    await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(merged), { expirationTtl: PRICES_TTL });
+    console.log(`Full sync batch ${startBatch}-${batch}: fetched ${allRecords.length}, total cached: ${merged.length}`);
 
-  // Record sync timestamp
-  const now = new Date().toISOString().replace("T", " ").substring(0, 19);
-  await env.FUEL_CACHE.put(KV_LAST_PRICE_SYNC, now, { expirationTtl: STATIONS_TTL });
+    if (reachedEnd) {
+      // Full sync complete — set timestamp so future syncs are incremental
+      const now = new Date().toISOString().replace("T", " ").substring(0, 19);
+      await env.FUEL_CACHE.put(KV_LAST_PRICE_SYNC, now, { expirationTtl: STATIONS_TTL });
+      await env.FUEL_CACHE.delete(KV_PRICE_BATCH_CURSOR);
+      console.log(`Full price sync complete: ${merged.length} stations with prices`);
+    } else {
+      // Save cursor to resume next run
+      await env.FUEL_CACHE.put(KV_PRICE_BATCH_CURSOR, String(batch), { expirationTtl: STATIONS_TTL });
+      console.log(`Full sync paused at batch ${batch}, will resume next cron`);
+    }
+  }
 }
 
 // --- HTTP Request Handler ---
