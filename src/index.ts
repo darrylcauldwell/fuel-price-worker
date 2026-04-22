@@ -41,10 +41,13 @@ const CORS_HEADERS = {
 };
 
 // Headers to pass CloudFront WAF on the government API
-const API_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
-  "Accept": "application/json, */*",
+const API_HEADERS: Record<string, string> = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+  "Accept": "application/json, text/html, */*",
   "Accept-Language": "en-GB,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Referer": "https://www.fuel-finder.service.gov.uk/",
+  "Origin": "https://www.fuel-finder.service.gov.uk",
 };
 
 // --- OAuth Token Management ---
@@ -69,10 +72,21 @@ async function getAccessToken(env: Env): Promise<string> {
     scope: "fuelfinder.read",
   });
 
+  // Use redirect: "follow" and no-cache to avoid CloudFront WAF edge-IP blocks
   const resp = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
-    headers: { ...API_HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      ...API_HEADERS,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Connection": "keep-alive",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+    },
     body: body.toString(),
+    redirect: "follow",
   });
 
   if (!resp.ok) {
@@ -81,17 +95,15 @@ async function getAccessToken(env: Env): Promise<string> {
   }
 
   const raw = await resp.text();
-  console.log("OAuth response:", raw);
   const data = JSON.parse(raw) as Record<string, unknown>;
-  // Extract token — handle nested response formats
+
+  // Handle nested response: {success: true, data: {access_token: ...}}
   const accessToken = (data.access_token || (data.data as Record<string, unknown>)?.access_token) as string;
   const expiresIn = (data.expires_in || (data.data as Record<string, unknown>)?.expires_in || 3600) as number;
 
   if (!accessToken) {
-    throw new Error(`OAuth response missing access_token: ${raw}`);
+    throw new Error(`OAuth response missing access_token: ${raw.substring(0, 200)}`);
   }
-
-  console.log(`Token obtained, expires in ${expiresIn}s, starts with: ${accessToken.substring(0, 20)}...`);
 
   const token: OAuthToken = {
     access_token: accessToken,
@@ -116,7 +128,6 @@ async function fetchAllBatches(endpoint: string, token: string, extraParams?: Re
       }
     }
     const url = `${endpoint}?${params.toString()}`;
-    console.log(`Fetching: ${url}`);
 
     const resp = await fetch(url, {
       headers: {
@@ -135,7 +146,6 @@ async function fetchAllBatches(endpoint: string, token: string, extraParams?: Re
     }
 
     const raw = await resp.text();
-    console.log(`Batch ${batch}: ${raw.length} bytes, first 200 chars: ${raw.substring(0, 200)}`);
     const parsed = JSON.parse(raw);
 
     // Response is a raw JSON array
@@ -242,6 +252,28 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       },
       { headers: CORS_HEADERS }
     );
+  }
+
+  // Manual sync trigger (for debugging — returns detailed error info)
+  if (url.pathname === "/api/v1/sync") {
+    try {
+      await syncStations(env);
+      await syncPrices(env);
+      const health = {
+        stations: await env.FUEL_CACHE.get(KV_STATIONS) ? "populated" : "empty",
+        prices: await env.FUEL_CACHE.get(KV_PRICES) ? "populated" : "empty",
+        lastPriceSync: await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC) || "never",
+      };
+      return Response.json(
+        { status: "synced", cache: health },
+        { headers: CORS_HEADERS }
+      );
+    } catch (err) {
+      return Response.json(
+        { status: "error", message: String(err) },
+        { status: 500, headers: CORS_HEADERS }
+      );
+    }
   }
 
   // Stations + prices endpoint (primary endpoint for the iOS app)
