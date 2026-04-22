@@ -1,0 +1,16 @@
+name = "fuel-price-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-22"
+
+# KV namespace for caching station and price data
+[[kv_namespaces]]
+binding = "FUEL_CACHE"
+id = ""  # Set after `wrangler kv namespace create FUEL_CACHE`
+
+# Secrets (set via `wrangler secret put`):
+#   FUEL_API_CLIENT_ID     — OAuth client_id from Fuel Finder developer portal
+#   FUEL_API_CLIENT_SECRET — OAuth client_secret from Fuel Finder developer portal
+
+# Cron trigger — refresh data every 5 minutes
+[triggers]
+crons = ["*/5 * * * *"]
