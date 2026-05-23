@@ -16,6 +16,9 @@ id = "061cb51abb314c9387f875bb1676ff2c"
 #   FUEL_API_CLIENT_ID     — OAuth client_id from Fuel Finder developer portal
 #   FUEL_API_CLIENT_SECRET — OAuth client_secret from Fuel Finder developer portal
 
-# Cron trigger — refresh data every 5 minutes
-[triggers]
-crons = ["*/5 * * * *"]
+# Data refresh is demand-driven: each /stations or /motorway-stations
+# request checks cache age and, if stale, fires a background sync via
+# ctx.waitUntil. No cron triggers — the gov API's WAF blocks Cloudflare
+# scheduled-context egress (Service Bindings + self-fetches inherit the
+# same blocked pool), so refreshes only work when initiated by a real
+# fetch invocation. The iOS app's polling provides the trigger schedule.

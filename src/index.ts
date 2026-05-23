@@ -27,6 +27,8 @@ const KV_STATIONS = "stations";
 const KV_PRICES = "prices";
 const KV_TOKEN = "oauth_token";
 const KV_LAST_PRICE_SYNC = "last_price_sync";
+const KV_LAST_SYNC_ERROR = "last_sync_error";
+const KV_LAST_SYNC_OK = "last_sync_ok";
 
 // Cache TTLs (seconds)
 // TTLs are set long so cached data survives API outages.
@@ -74,26 +76,43 @@ async function getAccessToken(env: Env): Promise<string> {
     scope: "fuelfinder.read",
   });
 
-  // Use redirect: "follow" and no-cache to avoid CloudFront WAF edge-IP blocks
-  const resp = await fetch(TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: {
-      ...API_HEADERS,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Connection": "keep-alive",
-      "Cache-Control": "no-cache",
-      "Pragma": "no-cache",
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "same-origin",
-    },
-    body: body.toString(),
-    redirect: "follow",
-  });
+  // Retry 403/429 with linear backoff. CloudFront's WAF challenges the OAuth
+  // endpoint intermittently, and a fixed cron that fails the token refresh
+  // would never recover until the KV TTLs drained. Same pattern as
+  // fetchAllBatches but inlined because this is a one-shot POST.
+  let resp: Response | undefined;
+  let attempt = 0;
+  while (attempt <= MAX_RETRIES) {
+    // Use redirect: "follow" and no-cache to avoid CloudFront WAF edge-IP blocks
+    resp = await fetch(TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: {
+        ...API_HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: body.toString(),
+      redirect: "follow",
+    });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`OAuth token request failed (${resp.status}): ${text}`);
+    if (resp.ok) break;
+    if ((resp.status === 429 || resp.status === 403) && attempt < MAX_RETRIES) {
+      attempt++;
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+      continue;
+    }
+    break;
+  }
+
+  if (!resp || !resp.ok) {
+    const status = resp?.status ?? 0;
+    const text = resp ? (await resp.text()).substring(0, 200) : "";
+    throw new Error(`OAuth token request failed (${status}) after ${attempt} retries: ${text}`);
   }
 
   const raw = await resp.text();
@@ -118,9 +137,13 @@ async function getAccessToken(env: Env): Promise<string> {
 
 // --- Paginated API Fetch ---
 
+const MAX_RETRIES = 4;
+const RETRY_DELAY_MS = 2000;
+
 async function fetchAllBatches(endpoint: string, token: string, extraParams?: Record<string, string>): Promise<unknown[]> {
   const allRecords: unknown[] = [];
   let batch = 1;
+  let retries = 0;
 
   while (true) {
     const params = new URLSearchParams({ "batch-number": String(batch) });
@@ -139,12 +162,16 @@ async function fetchAllBatches(endpoint: string, token: string, extraParams?: Re
     });
 
     if (!resp.ok) {
-      if (resp.status === 429) {
-        await new Promise((r) => setTimeout(r, 2000));
+      // 403 with empty body is CloudFront WAF challenging — intermittent and
+      // usually clears within a few seconds. Retry the same batch with a short
+      // delay, up to a small cap, before giving up. 429 gets the same treatment.
+      if ((resp.status === 429 || resp.status === 403) && retries < MAX_RETRIES) {
+        retries++;
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * retries));
         continue;
       }
       const text = await resp.text();
-      throw new Error(`API request failed (${resp.status}): ${text}`);
+      throw new Error(`API request failed (${resp.status}): ${text.substring(0, 200)}`);
     }
 
     const raw = await resp.text();
@@ -165,6 +192,7 @@ async function fetchAllBatches(endpoint: string, token: string, extraParams?: Re
     }
 
     batch++;
+    retries = 0; // Reset retry counter on each successful batch
   }
 
   return allRecords;
@@ -183,45 +211,55 @@ async function syncStations(env: Env): Promise<void> {
   console.log(`Synced ${stations.length} stations`);
 }
 
-// Maximum batches per invocation to stay within Worker execution time limits.
-// Each batch is one API call (~500 records). Full dataset is ~16 batches.
-// On cron (every 5 min) we progressively build the dataset over multiple runs.
-const MAX_BATCHES_PER_RUN = 2;
+// Maximum batches per invocation. Each batch is one API call (~500 records).
+// Full dataset is ~16-18 batches (~45s wall clock). Set comfortably above that so
+// a single cron run completes the full sync and `lastPriceSync` flips to a real
+// timestamp, switching subsequent runs to fast incremental mode.
+const MAX_BATCHES_PER_RUN = 25;
 const KV_PRICE_BATCH_CURSOR = "price_batch_cursor";
 
 async function syncPrices(env: Env): Promise<void> {
   const token = await getAccessToken(env);
 
   const lastSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
+  const existingRaw = await env.FUEL_CACHE.get(KV_PRICES);
 
-  if (lastSync) {
+  // Both timestamp AND cache must be present to safely go incremental.
+  // If the cache expired (e.g. after a 24h quiet period with no incremental
+  // changes refreshing its TTL) but the timestamp survived, an incremental
+  // sync would lose every station that didn't happen to update in this window.
+  // Fall back to a full sync instead.
+  if (lastSync && existingRaw) {
     // Incremental: fetch only changes since last sync (usually 1 batch, very fast)
     const prices = await fetchAllBatches(PRICES_ENDPOINT, token, {
       "effective-start-timestamp": lastSync,
     });
 
+    const existing = JSON.parse(existingRaw) as Record<string, unknown>[];
+    const priceMap = new Map<string, unknown>();
+    for (const p of existing) {
+      const record = p as Record<string, unknown>;
+      priceMap.set(record.node_id as string, record);
+    }
+    for (const p of prices) {
+      const record = p as Record<string, unknown>;
+      priceMap.set(record.node_id as string, record);
+    }
+
+    const merged = Array.from(priceMap.values());
+    // Always re-write to refresh KV TTL, even when prices.length === 0 — keeps
+    // the cache alive through quiet stretches when nothing changes upstream.
+    await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(merged), { expirationTtl: PRICES_TTL });
     if (prices.length > 0) {
-      const existingRaw = await env.FUEL_CACHE.get(KV_PRICES);
-      const existing = existingRaw ? (JSON.parse(existingRaw) as Record<string, unknown>[]) : [];
-
-      const priceMap = new Map<string, unknown>();
-      for (const p of existing) {
-        const record = p as Record<string, unknown>;
-        priceMap.set(record.node_id as string, record);
-      }
-      for (const p of prices) {
-        const record = p as Record<string, unknown>;
-        priceMap.set(record.node_id as string, record);
-      }
-
-      const merged = Array.from(priceMap.values());
-      await env.FUEL_CACHE.put(KV_PRICES, JSON.stringify(merged), { expirationTtl: PRICES_TTL });
       console.log(`Merged ${prices.length} incremental updates (total: ${merged.length})`);
     }
 
     const now = new Date().toISOString().replace("T", " ").substring(0, 19);
     await env.FUEL_CACHE.put(KV_LAST_PRICE_SYNC, now, { expirationTtl: STATIONS_TTL });
   } else {
+    // Reset cursor + timestamp before progressive full sync — otherwise a stale
+    // KV_LAST_PRICE_SYNC could leak into the next run if full sync gets re-entered.
+    if (lastSync) await env.FUEL_CACHE.delete(KV_LAST_PRICE_SYNC);
     // Full sync: progressive — fetch MAX_BATCHES_PER_RUN batches per invocation,
     // resume from cursor on next cron run until complete.
     const cursorStr = await env.FUEL_CACHE.get(KV_PRICE_BATCH_CURSOR);
@@ -242,12 +280,15 @@ async function syncPrices(env: Env): Promise<void> {
       });
 
       if (!resp.ok) {
-        if (resp.status === 429) {
-          console.log("Rate limited during full sync, will resume next run");
+        // 403 (WAF challenge) and 429 (rate limit) are both transient — pause
+        // the progressive sync, save the cursor, and resume next cron. The
+        // cursor logic below handles persisting where we got to.
+        if (resp.status === 429 || resp.status === 403) {
+          console.log(`Transient ${resp.status} during full sync at batch ${batch}, will resume next run`);
           break;
         }
         const text = await resp.text();
-        throw new Error(`Price fetch failed (${resp.status}): ${text}`);
+        throw new Error(`Price fetch failed (${resp.status}): ${text.substring(0, 200)}`);
       }
 
       const parsed = JSON.parse(await resp.text());
@@ -266,9 +307,11 @@ async function syncPrices(env: Env): Promise<void> {
       batch++;
     }
 
-    // Merge with existing partial data
-    const existingRaw = await env.FUEL_CACHE.get(KV_PRICES);
-    const existing = existingRaw ? (JSON.parse(existingRaw) as Record<string, unknown>[]) : [];
+    // Merge with existing partial data (from a resumed progressive sync).
+    // Re-read here rather than reusing the outer `existingRaw` because earlier
+    // iterations of a progressive sync may have written partial data to KV.
+    const partialRaw = await env.FUEL_CACHE.get(KV_PRICES);
+    const existing = partialRaw ? (JSON.parse(partialRaw) as Record<string, unknown>[]) : [];
 
     const priceMap = new Map<string, unknown>();
     for (const p of existing) {
@@ -298,9 +341,65 @@ async function syncPrices(env: Env): Promise<void> {
   }
 }
 
+// --- Demand-Driven Refresh ---
+
+// How stale cached data is allowed to become before a request triggers a
+// background refresh. 5 min sits well inside the CMA's 30-min publishing
+// requirement — drivers see prices that are at most ~5 min behind whatever
+// the retailer feed is publishing.
+const SOFT_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Full sync flow shared by background refresh and the manual /api/v1/sync
+ * endpoint. Records last-success / last-error to KV so /api/v1/health can
+ * surface pipeline state without needing wrangler tail.
+ */
+async function performSync(env: Env, incremental: boolean): Promise<void> {
+  try {
+    const existingStations = await env.FUEL_CACHE.get(KV_STATIONS);
+    if (!incremental || !existingStations) {
+      await syncStations(env);
+    }
+    await syncPrices(env);
+    await env.FUEL_CACHE.put(KV_LAST_SYNC_OK, new Date().toISOString(), { expirationTtl: STATIONS_TTL });
+    await env.FUEL_CACHE.delete(KV_LAST_SYNC_ERROR);
+  } catch (err) {
+    console.error("Sync error:", err);
+    const payload = JSON.stringify({
+      at: new Date().toISOString(),
+      message: String(err),
+    });
+    await env.FUEL_CACHE.put(KV_LAST_SYNC_ERROR, payload, { expirationTtl: STATIONS_TTL });
+    throw err;
+  }
+}
+
+/**
+ * If cache is older than SOFT_TTL_MS (or missing entirely), fire a refresh
+ * via ctx.waitUntil so the current response goes out immediately. The
+ * refresh runs in the SAME fetch-handler invocation — its outbound gov API
+ * calls therefore use the egress pool the WAF accepts. Scheduled triggers
+ * and Service Bindings both inherit a different (blocked) egress, which is
+ * why this whole architecture is demand-driven instead of cron-driven.
+ */
+async function maybeRefreshInBackground(env: Env, ctx: ExecutionContext): Promise<void> {
+  const lastSyncStr = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
+  if (!lastSyncStr) {
+    // Cold start — fire full sync. Current request will 503; next request
+    // (iOS retries) lands on warm cache.
+    ctx.waitUntil(performSync(env, false).catch(() => {}));
+    return;
+  }
+  // KV_LAST_PRICE_SYNC is stored as "YYYY-MM-DD HH:MM:SS" UTC by syncPrices.
+  const ageMs = Date.now() - Date.parse(lastSyncStr.replace(" ", "T") + "Z");
+  if (ageMs > SOFT_TTL_MS) {
+    ctx.waitUntil(performSync(env, true).catch(() => {}));
+  }
+}
+
 // --- HTTP Request Handler ---
 
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
   // CORS preflight
@@ -312,7 +411,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/v1/health") {
     const stations = await env.FUEL_CACHE.get(KV_STATIONS);
     const prices = await env.FUEL_CACHE.get(KV_PRICES);
-    const lastSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
+    const lastPriceSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
+    const lastSyncOk = await env.FUEL_CACHE.get(KV_LAST_SYNC_OK);
+    const lastSyncError = await env.FUEL_CACHE.get(KV_LAST_SYNC_ERROR);
 
     return Response.json(
       {
@@ -320,18 +421,27 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         cache: {
           stations: stations ? "populated" : "empty",
           prices: prices ? "populated" : "empty",
-          lastPriceSync: lastSync || "never",
+          lastPriceSync: lastPriceSync || "never",
+        },
+        sync: {
+          lastSuccess: lastSyncOk || "never",
+          lastError: lastSyncError || null,
         },
       },
       { headers: CORS_HEADERS }
     );
   }
 
-  // Manual sync trigger (for debugging — returns detailed error info)
+  // Manual sync trigger — for ops. Day-to-day refreshes happen on-demand,
+  // driven by /stations + /motorway-stations requests. This endpoint still
+  // exists for forcing a refresh from a terminal or for a daily safety-net
+  // ping if one is ever added. `?incremental=true` skips the slow stations
+  // resync when the cache is already populated.
   if (url.pathname === "/api/v1/sync") {
     try {
-      await syncStations(env);
-      await syncPrices(env);
+      const incremental = url.searchParams.get("incremental") === "true";
+      await performSync(env, incremental);
+
       const health = {
         stations: await env.FUEL_CACHE.get(KV_STATIONS) ? "populated" : "empty",
         prices: await env.FUEL_CACHE.get(KV_PRICES) ? "populated" : "empty",
@@ -349,8 +459,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  // Stations + prices endpoint (primary endpoint for the iOS app)
+  // Stations + prices endpoint (primary endpoint for the iOS app).
+  // Every call also checks cache age and may fire a background refresh.
   if (url.pathname === "/api/v1/stations") {
+    await maybeRefreshInBackground(env, ctx);
+
     const stationsRaw = await env.FUEL_CACHE.get(KV_STATIONS);
     const pricesRaw = await env.FUEL_CACHE.get(KV_PRICES);
 
@@ -391,8 +504,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     );
   }
 
-  // Motorway services only (convenience endpoint for motorway mode)
+  // Motorway services only (convenience endpoint for motorway mode).
+  // Same demand-driven refresh as /stations.
   if (url.pathname === "/api/v1/motorway-stations") {
+    await maybeRefreshInBackground(env, ctx);
+
     const stationsRaw = await env.FUEL_CACHE.get(KV_STATIONS);
     const pricesRaw = await env.FUEL_CACHE.get(KV_PRICES);
 
@@ -440,32 +556,20 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 // --- Worker Entry Point ---
 
 export default {
-  // HTTP request handler
-  async fetch(request: Request, env: Env): Promise<Response> {
+  // HTTP-only worker. No `scheduled` handler — Cloudflare cron triggers can't
+  // reach the gov API (its WAF blocks scheduled-context egress, even when
+  // routed through Service Bindings). Refreshes are demand-driven: each call
+  // to /stations or /motorway-stations checks cache age and may fire a
+  // background refresh via ctx.waitUntil. See maybeRefreshInBackground.
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (err) {
       console.error("Request error:", err);
       return Response.json(
         { error: "Internal server error" },
         { status: 500, headers: CORS_HEADERS }
       );
-    }
-  },
-
-  // Cron trigger — runs every 5 minutes
-  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
-    try {
-      // Sync stations once per day (check if cached)
-      const existingStations = await env.FUEL_CACHE.get(KV_STATIONS);
-      if (!existingStations) {
-        await syncStations(env);
-      }
-
-      // Always sync prices
-      await syncPrices(env);
-    } catch (err) {
-      console.error("Scheduled sync error:", err);
     }
   },
 };
