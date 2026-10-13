@@ -22,3 +22,9 @@ id = "061cb51abb314c9387f875bb1676ff2c"
 # scheduled-context egress (Service Bindings + self-fetches inherit the
 # same blocked pool), so refreshes only work when initiated by a real
 # fetch invocation. The iOS app's polling provides the trigger schedule.
+#
+# The explicit empty list is what clears a schedule: a deploy that omits
+# [triggers] leaves any previously registered cron in place, firing at a
+# worker with no `scheduled` handler (an exception every 5 minutes).
+[triggers]
+crons = []
