@@ -32,8 +32,8 @@ const KV_LAST_SYNC_OK = "last_sync_ok";
 const KV_OAUTH_BACKOFF = "oauth_backoff";
 
 // Cache TTLs (seconds)
-// TTLs are set long so cached data survives API outages.
-// The cron refreshes every 5 minutes regardless — TTL is a safety net, not the refresh driver.
+// TTLs are set long so cached data survives API outages. Prices refresh on
+// demand (see SOFT_TTL_MS); stations only resync once their key has expired.
 const STATIONS_TTL = 86400; // 24 hours — station metadata changes rarely
 const PRICES_TTL = 86400; // 24 hours — stale prices are better than no prices during an outage
 const TOKEN_TTL = 3500; // Just under 1 hour (tokens expire at 3600)
@@ -228,9 +228,9 @@ async function syncStations(env: Env): Promise<void> {
 }
 
 // Maximum batches per invocation. Each batch is one API call (~500 records).
-// Full dataset is ~16-18 batches (~45s wall clock). Set comfortably above that so
-// a single cron run completes the full sync and `lastPriceSync` flips to a real
-// timestamp, switching subsequent runs to fast incremental mode.
+// Full dataset is ~16-18 batches. Set comfortably above that so a single sync
+// completes the full dataset and `lastPriceSync` flips to a real timestamp,
+// switching subsequent runs to fast incremental mode.
 const MAX_BATCHES_PER_RUN = 25;
 const KV_PRICE_BATCH_CURSOR = "price_batch_cursor";
 
@@ -277,7 +277,7 @@ async function syncPrices(env: Env): Promise<void> {
     // KV_LAST_PRICE_SYNC could leak into the next run if full sync gets re-entered.
     if (lastSync) await env.FUEL_CACHE.delete(KV_LAST_PRICE_SYNC);
     // Full sync: progressive — fetch MAX_BATCHES_PER_RUN batches per invocation,
-    // resume from cursor on next cron run until complete.
+    // resume from cursor on the next sync until complete.
     const cursorStr = await env.FUEL_CACHE.get(KV_PRICE_BATCH_CURSOR);
     const startBatch = cursorStr ? parseInt(cursorStr, 10) : 1;
 
@@ -297,7 +297,7 @@ async function syncPrices(env: Env): Promise<void> {
 
       if (!resp.ok) {
         // 403 (WAF challenge) and 429 (rate limit) are both transient — pause
-        // the progressive sync, save the cursor, and resume next cron. The
+        // the progressive sync, save the cursor, and resume next sync. The
         // cursor logic below handles persisting where we got to.
         if (resp.status === 429 || resp.status === 403) {
           console.log(`Transient ${resp.status} during full sync at batch ${batch}, will resume next run`);
@@ -352,7 +352,7 @@ async function syncPrices(env: Env): Promise<void> {
     } else {
       // Save cursor to resume next run
       await env.FUEL_CACHE.put(KV_PRICE_BATCH_CURSOR, String(batch), { expirationTtl: STATIONS_TTL });
-      console.log(`Full sync paused at batch ${batch}, will resume next cron`);
+      console.log(`Full sync paused at batch ${batch}, will resume next sync`);
     }
   }
 }
