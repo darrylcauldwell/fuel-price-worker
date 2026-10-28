@@ -28,7 +28,6 @@ const KV_PRICES = "prices";
 const KV_TOKEN = "oauth_token";
 const KV_LAST_PRICE_SYNC = "last_price_sync";
 const KV_LAST_SYNC_ERROR = "last_sync_error";
-const KV_LAST_SYNC_OK = "last_sync_ok";
 const KV_OAUTH_BACKOFF = "oauth_backoff";
 
 // Cache TTLs (seconds)
@@ -365,15 +364,23 @@ async function syncPrices(env: Env): Promise<void> {
 // the retailer feed is publishing.
 const SOFT_TTL_MS = 5 * 60 * 1000;
 
-const KV_SYNC_LOCK = "sync_lock";
-// KV's minimum expirationTtl, so a sync that dies without releasing the lock
-// holds off other refreshes for at most a minute.
+// The lock lives in the Cache API rather than KV because a KV lock costs a
+// write per sync (see performSync). The Cache API is scoped to one data centre,
+// which is all a KV lock covered in practice before its write propagated.
+const SYNC_LOCK_PATH = "/__internal/sync-lock";
+// A sync that dies without releasing the lock holds off other refreshes for at
+// most this long.
 const SYNC_LOCK_TTL = 60;
 
 /**
  * Full sync flow shared by background refresh and the manual /api/v1/sync
- * endpoint. Records last-success / last-error to KV so /api/v1/health can
- * surface pipeline state without needing wrangler tail.
+ * endpoint. Records the last error to KV so /api/v1/health can surface
+ * pipeline state without needing wrangler tail; success shows as lastPriceSync.
+ *
+ * Workers Free allows 1,000 KV writes a day. At most one sync runs per
+ * SOFT_TTL_MS and a successful one writes two keys (prices, last_price_sync).
+ * Recheck that budget before adding a KV write to this path: past the limit,
+ * writes fail and prices stop updating until the daily reset.
  */
 async function performSync(env: Env, incremental: boolean): Promise<void> {
   try {
@@ -382,7 +389,6 @@ async function performSync(env: Env, incremental: boolean): Promise<void> {
       await syncStations(env);
     }
     await syncPrices(env);
-    await env.FUEL_CACHE.put(KV_LAST_SYNC_OK, new Date().toISOString(), { expirationTtl: STATIONS_TTL });
     await env.FUEL_CACHE.delete(KV_LAST_SYNC_ERROR);
   } catch (err) {
     console.error("Sync error:", err);
@@ -403,34 +409,37 @@ async function performSync(env: Env, incremental: boolean): Promise<void> {
  * and Service Bindings both inherit a different (blocked) egress, which is
  * why this whole architecture is demand-driven instead of cron-driven.
  */
-async function maybeRefreshInBackground(env: Env, ctx: ExecutionContext): Promise<void> {
+async function maybeRefreshInBackground(env: Env, ctx: ExecutionContext, origin: string): Promise<void> {
   const lastSyncStr = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
   if (!lastSyncStr) {
     // Cold start — fire full sync. Current request will 503; next request
     // (iOS retries) lands on warm cache.
-    await startBackgroundSync(env, ctx, false);
+    await startBackgroundSync(env, ctx, false, origin);
     return;
   }
   // KV_LAST_PRICE_SYNC is stored as "YYYY-MM-DD HH:MM:SS" UTC by syncPrices.
   const ageMs = Date.now() - Date.parse(lastSyncStr.replace(" ", "T") + "Z");
   if (ageMs > SOFT_TTL_MS) {
-    await startBackgroundSync(env, ctx, true);
+    await startBackgroundSync(env, ctx, true, origin);
   }
 }
 
 /**
  * Without the lock, every request that lands while the cache is stale starts
  * its own sync, and each one lacking a cached token makes its own OAuth
- * attempt. KV get-then-put isn't atomic and writes take time to reach other
- * locations, so this cuts duplicate syncs rather than guaranteeing exactly one.
+ * attempt. Cache match-then-put isn't atomic and each data centre has its own
+ * cache, so this cuts duplicate syncs rather than guaranteeing exactly one.
  */
-async function startBackgroundSync(env: Env, ctx: ExecutionContext, incremental: boolean): Promise<void> {
-  if (await env.FUEL_CACHE.get(KV_SYNC_LOCK)) return;
-  await env.FUEL_CACHE.put(KV_SYNC_LOCK, new Date().toISOString(), { expirationTtl: SYNC_LOCK_TTL });
+async function startBackgroundSync(env: Env, ctx: ExecutionContext, incremental: boolean, origin: string): Promise<void> {
+  // Keyed on the Worker's own origin so the entry sits in this zone's cache.
+  const lockKey = origin + SYNC_LOCK_PATH;
+  const cache = caches.default;
+  if (await cache.match(lockKey)) return;
+  await cache.put(lockKey, new Response("1", { headers: { "Cache-Control": `max-age=${SYNC_LOCK_TTL}` } }));
   ctx.waitUntil(
     performSync(env, incremental)
       .catch(() => {})
-      .finally(() => env.FUEL_CACHE.delete(KV_SYNC_LOCK))
+      .finally(() => cache.delete(lockKey))
   );
 }
 
@@ -449,7 +458,6 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     const stations = await env.FUEL_CACHE.get(KV_STATIONS);
     const prices = await env.FUEL_CACHE.get(KV_PRICES);
     const lastPriceSync = await env.FUEL_CACHE.get(KV_LAST_PRICE_SYNC);
-    const lastSyncOk = await env.FUEL_CACHE.get(KV_LAST_SYNC_OK);
     const lastSyncError = await env.FUEL_CACHE.get(KV_LAST_SYNC_ERROR);
 
     return Response.json(
@@ -461,7 +469,6 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
           lastPriceSync: lastPriceSync || "never",
         },
         sync: {
-          lastSuccess: lastSyncOk || "never",
           lastError: lastSyncError || null,
         },
       },
@@ -499,7 +506,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   // Stations + prices endpoint (primary endpoint for the iOS app).
   // Every call also checks cache age and may fire a background refresh.
   if (url.pathname === "/api/v1/stations") {
-    await maybeRefreshInBackground(env, ctx);
+    await maybeRefreshInBackground(env, ctx, url.origin);
 
     const stationsRaw = await env.FUEL_CACHE.get(KV_STATIONS);
     const pricesRaw = await env.FUEL_CACHE.get(KV_PRICES);
@@ -544,7 +551,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   // Motorway services only (convenience endpoint for motorway mode).
   // Same demand-driven refresh as /stations.
   if (url.pathname === "/api/v1/motorway-stations") {
-    await maybeRefreshInBackground(env, ctx);
+    await maybeRefreshInBackground(env, ctx, url.origin);
 
     const stationsRaw = await env.FUEL_CACHE.get(KV_STATIONS);
     const pricesRaw = await env.FUEL_CACHE.get(KV_PRICES);
