@@ -29,6 +29,7 @@ const KV_TOKEN = "oauth_token";
 const KV_LAST_PRICE_SYNC = "last_price_sync";
 const KV_LAST_SYNC_ERROR = "last_sync_error";
 const KV_LAST_SYNC_OK = "last_sync_ok";
+const KV_OAUTH_BACKOFF = "oauth_backoff";
 
 // Cache TTLs (seconds)
 // TTLs are set long so cached data survives API outages.
@@ -36,6 +37,10 @@ const KV_LAST_SYNC_OK = "last_sync_ok";
 const STATIONS_TTL = 86400; // 24 hours — station metadata changes rarely
 const PRICES_TTL = 86400; // 24 hours — stale prices are better than no prices during an outage
 const TOKEN_TTL = 3500; // Just under 1 hour (tokens expire at 3600)
+// The OAuth endpoint answers repeated failures with a 429 lockout ("Try again
+// in 5 minutes"). Every attempt made during the lockout is another failure, so
+// it has to be waited out rather than retried.
+const OAUTH_BACKOFF_TTL = 300;
 
 // CORS headers for mobile app access
 const CORS_HEADERS = {
@@ -68,6 +73,11 @@ async function getAccessToken(env: Env): Promise<string> {
     return cached.access_token;
   }
 
+  const backoff = await env.FUEL_CACHE.get(KV_OAUTH_BACKOFF);
+  if (backoff) {
+    throw new Error(`OAuth skipped during lockout backoff: ${backoff}`);
+  }
+
   // Fetch new token
   const body = new URLSearchParams({
     grant_type: "client_credentials",
@@ -76,10 +86,9 @@ async function getAccessToken(env: Env): Promise<string> {
     scope: "fuelfinder.read",
   });
 
-  // Retry 403/429 with linear backoff. CloudFront's WAF challenges the OAuth
-  // endpoint intermittently, and a fixed cron that fails the token refresh
-  // would never recover until the KV TTLs drained. Same pattern as
-  // fetchAllBatches but inlined because this is a one-shot POST.
+  // Retry 403 with linear backoff: CloudFront's WAF challenges the OAuth
+  // endpoint intermittently and the challenge clears within seconds. 429 is
+  // never retried — see OAUTH_BACKOFF_TTL.
   let resp: Response | undefined;
   let attempt = 0;
   while (attempt <= MAX_RETRIES) {
@@ -101,7 +110,7 @@ async function getAccessToken(env: Env): Promise<string> {
     });
 
     if (resp.ok) break;
-    if ((resp.status === 429 || resp.status === 403) && attempt < MAX_RETRIES) {
+    if (resp.status === 403 && attempt < MAX_RETRIES) {
       attempt++;
       await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
       continue;
@@ -112,7 +121,14 @@ async function getAccessToken(env: Env): Promise<string> {
   if (!resp || !resp.ok) {
     const status = resp?.status ?? 0;
     const text = resp ? (await resp.text()).substring(0, 200) : "";
-    throw new Error(`OAuth token request failed (${status}) after ${attempt} retries: ${text}`);
+    const message = `OAuth token request failed (${status}) after ${attempt} retries: ${text}`;
+    if (status === 429) {
+      const until = new Date(Date.now() + OAUTH_BACKOFF_TTL * 1000).toISOString();
+      await env.FUEL_CACHE.put(KV_OAUTH_BACKOFF, `until ${until} after ${message}`, {
+        expirationTtl: OAUTH_BACKOFF_TTL,
+      });
+    }
+    throw new Error(message);
   }
 
   const raw = await resp.text();
