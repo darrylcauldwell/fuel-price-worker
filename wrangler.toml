@@ -28,3 +28,9 @@ id = "061cb51abb314c9387f875bb1676ff2c"
 # worker with no `scheduled` handler (an exception every 5 minutes).
 [triggers]
 crons = []
+
+# Workers Logs keeps console output so a failed sync can be diagnosed after
+# the fact. `wrangler tail` only streams live events, and /api/v1/health
+# keeps only the most recent error.
+[observability]
+enabled = true

@@ -141,6 +141,8 @@ View live logs:
 npm run tail
 ```
 
+Past logs, including sync and OAuth errors, are kept by [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) and can be searched in the Cloudflare dashboard under the Worker's Observability tab.
+
 Check cache status:
 
 ```bash
