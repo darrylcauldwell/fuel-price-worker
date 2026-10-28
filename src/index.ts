@@ -359,10 +359,11 @@ async function syncPrices(env: Env): Promise<void> {
 // --- Demand-Driven Refresh ---
 
 // How stale cached data is allowed to become before a request triggers a
-// background refresh. 5 min sits well inside the CMA's 30-min publishing
-// requirement — drivers see prices that are at most ~5 min behind whatever
-// the retailer feed is publishing.
-const SOFT_TTL_MS = 5 * 60 * 1000;
+// background refresh, well inside the CMA's 30-min publishing requirement.
+// Deliberately under 5 min: a sync stamps its time a few seconds after the
+// request that started it, so at exactly 5 min, requests arriving every 5 min
+// would find the cache fresh and refresh only every 10 min.
+const SOFT_TTL_MS = 270 * 1000;
 
 // The lock lives in the Cache API rather than KV because a KV lock costs a
 // write per sync (see performSync). The Cache API is scoped to one data centre,

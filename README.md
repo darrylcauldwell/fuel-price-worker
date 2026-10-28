@@ -14,13 +14,13 @@ Workers are ideal for lightweight tasks like caching and proxying APIs: no serve
 
 ## Why this exists
 
-The UK Government mandates all fuel retailers to report prices via the Fuel Finder API. The API requires OAuth credentials that [must not be embedded in mobile apps](https://www.developer.fuel-finder.service.gov.uk/dev-guideline). This Worker holds the credentials, refreshes data whenever its cache is more than 5 minutes old, caches it in CloudFlare KV, and serves a simple JSON API that the [FuelFinder iOS app](https://github.com/darrylcauldwell/FuelFinder) can call without authentication.
+The UK Government mandates all fuel retailers to report prices via the Fuel Finder API. The API requires OAuth credentials that [must not be embedded in mobile apps](https://www.developer.fuel-finder.service.gov.uk/dev-guideline). This Worker holds the credentials, refreshes data whenever its cache is more than 4½ minutes old, caches it in CloudFlare KV, and serves a simple JSON API that the [FuelFinder iOS app](https://github.com/darrylcauldwell/FuelFinder) can call without authentication.
 
 ## Architecture
 
 ```
 UK Gov Fuel Finder API
-    ↓ (OAuth, on request once the cache is 5+ min old)
+    ↓ (OAuth, on request once the cache is 4½+ min old)
 CloudFlare Worker
     ↓ (caches in KV store)
 CloudFlare Edge (300+ locations)
@@ -113,7 +113,7 @@ curl http://localhost:8787/api/v1/motorway-stations
 
 ### Refresh (on demand)
 
-Each request to `/stations` or `/motorway-stations` checks the age of the cached prices. If they are more than 5 minutes old, the Worker starts a background sync and answers from cache without waiting for it. Only one sync runs at a time; requests that arrive during a sync skip starting another.
+Each request to `/stations` or `/motorway-stations` checks the age of the cached prices. If they are more than 4½ minutes old, the Worker starts a background sync and answers from cache without waiting for it. Only one sync runs at a time; requests that arrive during a sync skip starting another.
 
 There are no cron triggers: the gov API's WAF blocks requests from Cloudflare scheduled invocations, so a refresh only happens when a request comes in.
 
@@ -132,7 +132,7 @@ Tokens are cached in KV for just under 1 hour (tokens expire at 3600s). A new to
 
 The Worker complies with the [Fuel Finder Fair Use Policy](https://www.developer.fuel-finder.service.gov.uk/):
 
-- Refreshes whenever a request finds the cache more than 5 minutes old
+- Refreshes whenever a request finds the cache more than 4½ minutes old
 - Serves data unmodified (no price manipulation or selective filtering)
 - Timestamps preserved as-is
 - Credentials stored in Worker secrets, not exposed to clients
