@@ -365,6 +365,11 @@ async function syncPrices(env: Env): Promise<void> {
 // the retailer feed is publishing.
 const SOFT_TTL_MS = 5 * 60 * 1000;
 
+const KV_SYNC_LOCK = "sync_lock";
+// KV's minimum expirationTtl, so a sync that dies without releasing the lock
+// holds off other refreshes for at most a minute.
+const SYNC_LOCK_TTL = 60;
+
 /**
  * Full sync flow shared by background refresh and the manual /api/v1/sync
  * endpoint. Records last-success / last-error to KV so /api/v1/health can
@@ -403,14 +408,30 @@ async function maybeRefreshInBackground(env: Env, ctx: ExecutionContext): Promis
   if (!lastSyncStr) {
     // Cold start — fire full sync. Current request will 503; next request
     // (iOS retries) lands on warm cache.
-    ctx.waitUntil(performSync(env, false).catch(() => {}));
+    await startBackgroundSync(env, ctx, false);
     return;
   }
   // KV_LAST_PRICE_SYNC is stored as "YYYY-MM-DD HH:MM:SS" UTC by syncPrices.
   const ageMs = Date.now() - Date.parse(lastSyncStr.replace(" ", "T") + "Z");
   if (ageMs > SOFT_TTL_MS) {
-    ctx.waitUntil(performSync(env, true).catch(() => {}));
+    await startBackgroundSync(env, ctx, true);
   }
+}
+
+/**
+ * Without the lock, every request that lands while the cache is stale starts
+ * its own sync, and each one lacking a cached token makes its own OAuth
+ * attempt. KV get-then-put isn't atomic and writes take time to reach other
+ * locations, so this cuts duplicate syncs rather than guaranteeing exactly one.
+ */
+async function startBackgroundSync(env: Env, ctx: ExecutionContext, incremental: boolean): Promise<void> {
+  if (await env.FUEL_CACHE.get(KV_SYNC_LOCK)) return;
+  await env.FUEL_CACHE.put(KV_SYNC_LOCK, new Date().toISOString(), { expirationTtl: SYNC_LOCK_TTL });
+  ctx.waitUntil(
+    performSync(env, incremental)
+      .catch(() => {})
+      .finally(() => env.FUEL_CACHE.delete(KV_SYNC_LOCK))
+  );
 }
 
 // --- HTTP Request Handler ---
